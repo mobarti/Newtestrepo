@@ -1,90 +1,49 @@
-# This file is a template, and might need editing before it works on your project.
-# To contribute improvements to CI/CD templates, please follow the Development guide at:
-# https://docs.gitlab.com/ee/development/cicd/templates.html
-# This specific template is located at:
-# https://gitlab.com/gitlab-org/gitlab/-/blob/master/lib/gitlab/ci/templates/5-Minute-Production-App.gitlab-ci.yml
+image: docker:19.03.10
 
-# This template is on early stage of development.
-# Use it with caution. For usage instruction please read
-# https://gitlab.com/gitlab-org/5-minute-production-app/deploy-template/-/blob/v3.0.0/README.md
+services:
+  - docker:dind
 
-include:
-  # workflow rules to prevent duplicate detached pipelines
-  - template: 'Workflows/Branch-Pipelines.gitlab-ci.yml'
-  # auto devops build
-  - template: 'Jobs/Build.gitlab-ci.yml'
+variables:
+  REPOSITORY_URL: <REPOSITORY_URL>
+  TASK_DEFINITION_NAME: <Task_Definition>
+  CLUSTER_NAME: <CLUSTER_NAME>
+  SERVICE_NAME: <SERVICE_NAME>
+
+before_script:
+  - apk add --no-cache curl jq python py-pip
+  - pip install awscli
+  - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+  - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+  - aws configure set region $AWS_DEFAULT_REGION
+  - $(aws ecr get-login --no-include-email --region "${AWS_DEFAULT_REGION}")
+  - IMAGE_TAG="$(echo $CI_COMMIT_SHA | head -c 8)"
 
 stages:
   - build
-  - test
-  - provision
   - deploy
-  - destroy
 
-variables:
-  TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${CI_COMMIT_REF_SLUG}
-  TF_VAR_ENVIRONMENT_NAME: ${CI_PROJECT_PATH_SLUG}_${CI_PROJECT_ID}_${CI_COMMIT_REF_SLUG}
-  TF_VAR_SERVICE_DESK_EMAIL: incoming+${CI_PROJECT_PATH_SLUG}-${CI_PROJECT_ID}-issue-@incoming.gitlab.com
-  TF_VAR_SHORT_ENVIRONMENT_NAME: ${CI_PROJECT_ID}-${CI_COMMIT_REF_SLUG}
-  TF_VAR_SMTP_FROM: ${SMTP_FROM}
-
-cache:
-  paths:
-    - .terraform
-
-.needs_aws_vars:
-  rules:
-    - if: '$AWS_ACCESS_KEY_ID && $AWS_SECRET_ACCESS_KEY && $AWS_DEFAULT_REGION'
-      when: on_success
-    - when: never
-
-terraform_apply:
-  stage: provision
-  image: "$CI_TEMPLATE_REGISTRY_HOST/gitlab-org/5-minute-production-app/deploy-template/stable"
-  extends: .needs_aws_vars
-  resource_group: terraform
-  before_script:
-    - cp /*.tf .
-    - cp /deploy.sh .
+build:
+  stage: build
   script:
-    - gitlab-terraform init
-    - gitlab-terraform plan
-    - gitlab-terraform plan-json
-    - gitlab-terraform apply
+    - echo "Building image..."
+    - docker build -t $REPOSITORY_URL:latest .
+    - echo "Tagging image..."
+    - docker tag $REPOSITORY_URL:latest $REPOSITORY_URL:$IMAGE_TAG
+    - echo "Pushing image..."
+    - docker push $REPOSITORY_URL:latest
+    - docker push $REPOSITORY_URL:$IMAGE_TAG
+  only:
+    - master
 
 deploy:
   stage: deploy
-  image: "$CI_TEMPLATE_REGISTRY_HOST/gitlab-org/5-minute-production-app/deploy-template/stable"
-  extends: .needs_aws_vars
-  resource_group: deploy
-  before_script:
-    - cp /*.tf .
-    - cp /deploy.sh .
-    - cp /conf.nginx .
   script:
-    - ./deploy.sh
-  artifacts:
-    reports:
-      dotenv: deploy.env
-  environment:
-    name: $CI_COMMIT_REF_SLUG
-    url: $DYNAMIC_ENVIRONMENT_URL
-    on_stop: terraform_destroy
-
-terraform_destroy:
-  variables:
-    GIT_STRATEGY: none
-  stage: destroy
-  image: "$CI_TEMPLATE_REGISTRY_HOST/gitlab-org/5-minute-production-app/deploy-template/stable"
-  before_script:
-    - cp /*.tf .
-    - cp /deploy.sh .
-  script:
-    - gitlab-terraform destroy -auto-approve
-  environment:
-    name: $CI_COMMIT_REF_SLUG
-    action: stop
-  rules:
-    - if: '$AWS_ACCESS_KEY_ID && $AWS_SECRET_ACCESS_KEY && $AWS_DEFAULT_REGION && $CI_COMMIT_REF_PROTECTED == "false"'
-      when: manual
-    - when: never
+    - echo $REPOSITORY_URL:$IMAGE_TAG
+    - TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition "$TASK_DEFINITION_NAME" --region "${AWS_DEFAULT_REGION}")
+    - NEW_CONTAINER_DEFINTIION=$(echo $TASK_DEFINITION | jq --arg IMAGE "$REPOSITORY_URL:$IMAGE_TAG" '.taskDefinition.containerDefinitions[0].image = $IMAGE | .taskDefinition.containerDefinitions[0]')
+    - echo "Registering new container definition..."
+    - aws ecs register-task-definition --region "${AWS_DEFAULT_REGION}" --family "${TASK_DEFINITION_NAME}" --container-definitions "${NEW_CONTAINER_DEFINTIION}"
+    - echo "Updating the service..."
+    - aws ecs update-service --region "${AWS_DEFAULT_REGION}" --cluster "${CLUSTER_NAME}" --service "${SERVICE_NAME}"  --task-definition "${TASK_DEFINITION_NAME}"
+  only:
+    - developer
