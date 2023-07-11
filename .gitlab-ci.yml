@@ -32,7 +32,7 @@ build:
     - docker push $REPOSITORY_URL:latest
     - docker push $REPOSITORY_URL:$IMAGE_TAG
   only:
-    - master
+    - developer
 
 deploy:
   stage: deploy
